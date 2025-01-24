@@ -8,15 +8,12 @@
 name: OpenWrt-CI
 
 on:
-  schedule:
-    - cron: 0 20 * * *
-
-permissions:
-  contents: read
+  workflow_dispatch:
+  push:
 
 jobs:
 
-  build_openwrt:
+  build:
 
     name: Build OpenWrt Firmware
 
@@ -39,8 +36,37 @@ jobs:
           sudo -E apt clean
           sudo -E timedatectl set-timezone "Asia/Shanghai"
 
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          # this might remove tools that are actually needed,
+          # if set to "true" but frees about 6 GB
+          tool-cache: true
+          
+          # all of these default to true, but feel free to set to
+          # "false" if necessary for your workflow
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
       - name: Checkout OpenWrt
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4  
+        with:   
+          fetch-depth: 0
+
+      - name: cache
+        uses: stupidloud/cachewrtbuild@main
+        with:
+          #是否一并缓存.ccache目录，如果你启用了ccache。这是唯一的常用参数，其他三个用于除错，一般不需要调整
+          ccache: true
+          #是否缓存工具链目录
+          toolchain: true
+          #是否跳过工具链编译
+          skip: true
+          #清空缓存
+          clean: false
 
       - name: Update feeds
         run: |
@@ -49,7 +75,28 @@ jobs:
           ./scripts/feeds install -a
 
       - name: Generate configuration file
-        run: make defconfig
+        run: |
+          cat <<EOF | sed -E 's/^  //' >.config
+            CONFIG_DEVEL=y
+            CONFIG_CCACHE=y
+            
+            CONFIG_PACKAGE_luci-app-alist=n
+            CONFIG_PACKAGE_luci-app-unblockmusic=n
+
+            CONFIG_TARGET_qualcommax=y
+            CONFIG_TARGET_qualcommax_ipq50xx=y
+
+            CONFIG_IB=y
+            # CONFIG_IB_STANDALONE is not set
+            CONFIG_SDK=y
+            CONFIG_MAKE_TOOLCHAIN=y
+
+            CONFIG_ALL_NONSHARED=y
+            CONFIG_REPRODUCIBLE_DEBUG_INFO=y
+
+            CONFIG_PACKAGE_luci=y
+          EOF
+          make defconfig
 
       - name: Download packages
         run: make download -j16
@@ -74,20 +121,123 @@ jobs:
           cp -rf $(find ./bin/packages/ -type f -name "*.ipk") ./artifact/package/
           cp -rf $(find ./bin/targets/ -type f -name "*.buildinfo" -o -name "*.manifest") ./artifact/buildinfo/
 
-      - name: Upload buildinfo
+      - name: Upload bin to artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: OpenWrt_buildinfo
-          path: ./artifact/buildinfo/
+          name: bin-qualcommax-ipq50xx
+          path: bin/targets/qualcommax/ipq50xx/*
 
-      - name: Upload package
+      - name: Upload dl to artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: OpenWrt_package
-          path: ./artifact/package/
+          name: dl
+          path: dl/*
 
-      - name: Upload firmware
-        uses: actions/upload-artifact@v4
+  gh-pages:
+    needs: [ build ]
+    runs-on: ubuntu-20.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout gh-pages
+        uses: actions/checkout@v4
         with:
-          name: OpenWrt_firmware
-          path: ./bin/targets/
+          path: 'gh-pages'
+          ref: 'gh-pages'
+          fetch-depth: 0
+
+      - name: Configure the git user
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Drop old versions
+        run: |
+          cd gh-pages
+          readarray -t old_version < <(git log --format='%h' -- "${GITHUB_REF_NAME}" | tail -n +10)
+          GIT_SEQUENCE_EDITOR="sed -i '1 i break'" git rebase --interactive --committer-date-is-author-date --root
+          for commit in "${old_version[@]}"; do
+            sed -i "/${commit}/d" .git/rebase-merge/git-rebase-todo
+          done
+          git rebase --continue
+
+      - name: Download bin from artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: bin-qualcommax-ipq50xx
+          path: bin/
+
+      - name: Copy contents
+        run: |
+          version="$(cat "bin/version.buildinfo")"
+          mkdir -p "gh-pages/${GITHUB_REF_NAME}/${version}/"
+          cp -avr bin/packages/* "gh-pages/${GITHUB_REF_NAME}/${version}/"
+
+      - name: Commit
+        run: |
+          cd gh-pages
+          git add .
+          git commit -m "Add: ${GITHUB_REF_NAME}: $(cat ../bin/version.buildinfo)"
+
+      - name: Publish
+        run: |
+          cd gh-pages
+          git push -f origin gh-pages
+          
+  release:
+    needs: [ build ]
+    runs-on: ubuntu-20.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download dl from artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dl
+          path: dl/
+
+      - name: Download bin from artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: bin-qualcommax-ipq50xx
+          path: bin/targets/qualcommax/ipq50xx/
+
+      - name: Generate release informations
+        run: |
+          TIME="$(curl "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" | jq -r .created_at)"
+
+          TAG="ci-${GITHUB_REF_NAME}-$(date -d "${TIME}" -u +'%Y%m%d-%H%M%S-%Z')"
+          echo "TAG=$TAG" >>$GITHUB_ENV
+
+          cat <<EOF | sed -E 's/^  //' >Release.md
+            CI ${GITHUB_REF_NAME} $(date -d "${TIME}" -u +'%Y-%m-%d %H:%M:%S %Z(%:z)')
+
+            # ${GITHUB_REF_NAME}
+
+            Build time: \`$(date -d "${TIME}" -u +'%Y-%m-%d %H:%M:%S %Z(%:z)')\`
+            Release version: ${TAG}
+
+            ## Sources
+            $(cat bin/targets/qualcommax/ipq50xx/feeds.buildinfo | awk -F'[ ^]' '{printf "%s: `%s`\n", $2, $4}')
+
+            ## SHA256
+            $(cat bin/targets/qualcommax/ipq50xx/sha256sums | awk '{printf "%s: `%s`\n", $2, $1}' | sed -E 's/^\*//')
+          EOF
+
+          echo "NAME=$(head --line=1 Release.md)" >>$GITHUB_ENV
+          tail --line=+2 Release.md >Body.md
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        with:
+          prerelease: true
+          tag_name: ${{ env.TAG }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ env.NAME }}
+          body_path: Body.md
+          files: |
+            bin/targets/qualcommax/ipq50xx/sha256sums
+            bin/targets/qualcommax/ipq50xx/*.*

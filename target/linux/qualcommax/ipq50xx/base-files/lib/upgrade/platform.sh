@@ -10,6 +10,13 @@ platform_check_image() {
 
 platform_do_upgrade() {
 	case "$(board_name)" in
+	redmi,ax3000)
+		if [ "$(find_mtd_index rootfs_1)" -eq "" ]; then
+			nand_do_upgrade "$1"
+		else
+			mi_dualboot_do_upgrade "$1"
+		fi
+		;;
 	glinet,gl-b3000)
 		nand_do_upgrade "$1"
 		;;
